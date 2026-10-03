@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategySoonestReset       schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -170,6 +171,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *SoonestResetSelector:
+		return schedulerStrategySoonestReset
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -515,6 +518,33 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	}
 	if !hasCandidate {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+
+	if strategy == schedulerStrategySoonestReset {
+		pooled := make([]*Auth, 0)
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			bucket := shard.readyByPriority[bestPriority]
+			if bucket == nil {
+				continue
+			}
+			for _, entry := range bucket.all.flat {
+				if entry == nil || entry.auth == nil {
+					continue
+				}
+				if predicate != nil && !predicate(entry) {
+					continue
+				}
+				pooled = append(pooled, entry.auth)
+			}
+		}
+		picked := pickSoonestResetAuth(pooled, model, time.Now())
+		if picked == nil {
+			return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+		}
+		return picked, executorKeyFromAuth(picked), nil
 	}
 
 	if strategy == schedulerStrategyFillFirst {
@@ -1378,6 +1408,12 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategySoonestReset:
+		now := time.Now()
+		picked = view.pickSoonestReset(predicate, m.modelKey, now)
+		if picked == nil && view != &bucket.all {
+			picked = bucket.all.pickSoonestReset(predicate, m.modelKey, now)
+		}
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
